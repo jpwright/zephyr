@@ -16,4 +16,5 @@ supported:
   - adc
   - gpio
   - rtc
+  - counter
 vendor: zephyr

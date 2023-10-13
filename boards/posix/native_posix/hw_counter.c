@@ -82,12 +82,25 @@ void hw_counter_stop(void)
 	hwm_find_next_timer();
 }
 
+bool hw_counter_is_started(void)
+{
+	return counter_running;
+}
+
 /**
  * Returns the current counter value.
  */
 uint64_t hw_counter_get_value(void)
 {
 	return counter_value;
+}
+
+/**
+ * Resets the counter value.
+ */
+void hw_counter_reset(void)
+{
+	counter_value = 0;
 }
 
 /**

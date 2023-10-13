@@ -23,17 +23,55 @@
 
 static struct counter_alarm_cfg pending_alarm;
 static bool is_alarm_pending;
+static struct counter_top_cfg top;
+static bool is_top_set;
 static const struct device *device;
+static uint32_t last_top;
+static uint32_t next_top;
 
 static void counter_isr(const void *arg)
 {
 	ARG_UNUSED(arg);
 	uint32_t current_value = hw_counter_get_value();
 
-	if (is_alarm_pending) {
+	/* Process `top` first to ensure new target is used in any subsequent
+	 * calls to `ctr_set_alarm`.
+	 */
+	if (is_top_set && (current_value == (last_top + top.ticks))) {
+		if (top.callback) {
+			top.callback(device, top.user_data);
+		}
+		last_top = current_value;
+		next_top = current_value + top.ticks;
+
+		if (next_top < last_top) {
+			hw_counter_set_target(TOP_VALUE);
+		} else {
+			hw_counter_set_target(next_top);
+		}
+	}
+
+	if (is_alarm_pending && (current_value == pending_alarm.ticks)) {
 		is_alarm_pending = false;
-		pending_alarm.callback(device, 0, current_value,
-				       pending_alarm.user_data);
+		if (pending_alarm.callback) {
+			pending_alarm.callback(device, 0, current_value,
+								   pending_alarm.user_data);
+		}
+	}
+
+	/* Rollover when `TOP_VALUE` is reached, then set the next target */
+	if (current_value == TOP_VALUE) {
+		hw_counter_reset();
+
+		if (is_alarm_pending && is_top_set) {
+			hw_counter_set_target(MIN(pending_alarm.ticks, next_top));
+		} else if (is_alarm_pending) {
+			hw_counter_set_target(pending_alarm.ticks);
+		} else if (is_top_set) {
+			hw_counter_set_target(next_top);
+		} else {
+			hw_counter_set_target(TOP_VALUE);
+		}
 	}
 }
 
@@ -41,6 +79,7 @@ static int ctr_init(const struct device *dev)
 {
 	device = dev;
 	is_alarm_pending = false;
+	is_top_set = false;
 
 	IRQ_CONNECT(COUNTER_EVENT_IRQ, COUNTER_NATIVE_POSIX_IRQ_PRIORITY,
 		    counter_isr, NULL, COUNTER_NATIVE_POSIX_IRQ_FLAGS);
@@ -84,15 +123,42 @@ static int ctr_set_top_value(const struct device *dev,
 			     const struct counter_top_cfg *cfg)
 {
 	ARG_UNUSED(dev);
-	ARG_UNUSED(cfg);
 
-	posix_print_warning("%s not supported\n", __func__);
-	return -ENOTSUP;
+	if (is_alarm_pending) {
+		posix_print_warning("Can't set top value while alarm is active\n");
+		return -EBUSY;
+	}
+
+	uint32_t current_value = hw_counter_get_value();
+
+	if (cfg->flags & COUNTER_TOP_CFG_DONT_RESET) {
+		if (current_value >= cfg->ticks) {
+			if (cfg->flags & COUNTER_TOP_CFG_RESET_WHEN_LATE) {
+				hw_counter_reset();
+			}
+			return -ETIME;
+		}
+	} else {
+		hw_counter_reset();
+	}
+
+	top = *cfg;
+	last_top = current_value;
+
+	if ((cfg->ticks != TOP_VALUE) && cfg->callback) {
+		is_top_set = true;
+		hw_counter_set_target(current_value + cfg->ticks);
+		irq_enable(COUNTER_EVENT_IRQ);
+	} else {
+		is_top_set = false;
+	}
+
+	return 0;
 }
 
 static uint32_t ctr_get_top_value(const struct device *dev)
 {
-	return TOP_VALUE;
+	return top.ticks;
 }
 
 static int ctr_set_alarm(const struct device *dev, uint8_t chan_id,
@@ -105,15 +171,33 @@ static int ctr_set_alarm(const struct device *dev, uint8_t chan_id,
 		return -ENOTSUP;
 	}
 
-	pending_alarm = *alarm_cfg;
-	is_alarm_pending = true;
+	if (is_alarm_pending)
+		return -EBUSY;
+
+	uint32_t ticks = alarm_cfg->ticks;
+	uint32_t current_value = hw_counter_get_value();
 
 	if (!(alarm_cfg->flags & COUNTER_ALARM_CFG_ABSOLUTE)) {
-		pending_alarm.ticks =
-			hw_counter_get_value() + pending_alarm.ticks;
+		ticks += current_value;
 	}
 
-	hw_counter_set_target(pending_alarm.ticks);
+	if (is_top_set && ((ticks - current_value) > (top.ticks - current_value))) {
+		posix_print_warning("Alarm ticks %u exceed top ticks %u\n", ticks,
+				    top.ticks);
+		return -EINVAL;
+	}
+
+	pending_alarm = *alarm_cfg;
+	pending_alarm.ticks = ticks;
+	is_alarm_pending = true;
+
+	/* set target to sooner of `ticks` and `TOP_VALUE`, accounting for rollover */
+	if ((TOP_VALUE - current_value) < (ticks - current_value)) {
+		hw_counter_set_target(TOP_VALUE);
+	} else {
+		hw_counter_set_target(pending_alarm.ticks);
+	}
+
 	irq_enable(COUNTER_EVENT_IRQ);
 
 	return 0;
@@ -125,6 +209,11 @@ static int ctr_cancel_alarm(const struct device *dev, uint8_t chan_id)
 
 	if (chan_id >= DRIVER_CONFIG_INFO_CHANNELS) {
 		posix_print_warning("channel %u is not supported\n", chan_id);
+		return -ENOTSUP;
+	}
+
+	if (!hw_counter_is_started()) {
+		posix_print_warning("Counter not started\n");
 		return -ENOTSUP;
 	}
 
